@@ -1,0 +1,1 @@
+/home/wangfc/.venvs/bypy/bin/bypy downdir "202501" ~/tmp_data/202501
