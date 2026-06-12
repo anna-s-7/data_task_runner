@@ -1,0 +1,7 @@
+# Dependencies for data_task_runner tasks.
+# md_snapshot_zip_to_parquet / md_trade_zip_to_parquet:
+pandas
+pyarrow
+# hkg_earnings_scrape (HK earnings scraper -> announcement-date partitions):
+requests
+akshare
