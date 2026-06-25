@@ -3,16 +3,18 @@
 A lightweight framework for running **market-data ETL tasks** from a Jupyter notebook UI.
 
 Each task is a self-contained Python script under `tasks/`; the notebook
-(`runner_UI.ipynb`) is a thin config-and-run front end over them. Today there are three
+(`runner_UI.ipynb`) is a thin config-and-run front end over them. Today there are four
 tasks: convert daily HKG market-snapshot zips and daily HKG market-trade zips into
-per-ticker parquet files, and scrape HKG company earnings into per-announcement-date
-CSV partitions.
+per-ticker parquet files, distil those per-ticker parquet into daily EOD bars + features,
+and scrape HKG company earnings into per-announcement-date CSV partitions.
 
 Every task declares a **`kind`** in its `TASKS` config section, which selects how the
 notebook drives it:
 
 - `zip_days` — discover days by globbing `<src>/*.zip`; pass `--src` + `--date-range`
   (the two `md_*_zip_to_parquet` tasks).
+- `eod_build` — discover trading days from the snapshot parquet tree; pass `--date-range`
+  (the task auto-builds the lookback/forward window for windowed features) (`md_eod_build`).
 - `scrape` — no local input; pass `--out`/`--work-dir` + `--date-range`
   (`hkg_earnings_scrape`).
 
@@ -121,6 +123,75 @@ trades, columns `ticker,tradeid,date,datetime,price,volume,type,cancelflag`):
 
 Key functions mirror the snapshot task: `process_day(zip_path, out_base) -> dict`
 and `main(argv)`.
+
+**Dependencies:** `pandas`, `pyarrow` (plus the standard library).
+
+### Existing task: `md_eod_build`
+
+`tasks/md_eod_build.py` — distils the per-ticker **snapshot** and **trade** parquet trees
+(produced by the two `md_*_zip_to_parquet` tasks) into daily end-of-day bars plus
+cross-day features. Its `kind` is `eod_build`: it discovers trading days from the snapshot
+tree (no zips) and reads no `--src` zips.
+
+For each ticker-day it records:
+
+- **`open` / `high` / `low` / `close` / `volume` / `amount` / `preclose`** — taken from the
+  **official EOD summary** row of the snapshot stream (the last row carrying the day's max
+  cumulative volume), i.e. the exchange-published figures, not a re-aggregation of raw
+  ticks (raw ticks include odd-lots / special trade types that disagree with the official
+  O/H/L). The trade tree is used only for an optional cross-check (`--cross-check`).
+- **`vwap`** — computed as `amount / volume` (the snapshot's own `VWAP` field is unused; it
+  is reported as 0).
+- **`trading_minutes`** — count of distinct `HH:MM` minutes in which the ticker had **any**
+  orderbook update that day (pre-open / closing auction included).
+- **`fwd_ret_1d` / `fwd_ret_5d` / `fwd_ret_21d`** — close-to-close forward returns at 1/5/21
+  **trading-day** offsets (`close[t+h]/close[t] - 1`).
+- **`adv63`** — trailing 63-trading-day mean of daily `amount` (HKD turnover); requires a
+  full 63-day window (NaN otherwise).
+
+Tickers that have an orderbook but never trade that day get `volume=0` and NaN OHLC / vwap
+(but a real `trading_minutes`).
+
+**Two-stage pipeline:**
+
+1. **daily bars** (per-day, parallel) — write an intermediate panel
+   `<out>/daily/<yyyy>/<YYYYMMDD>.parquet` (all tickers). Cached: existing days are reused
+   unless `--force`.
+2. **features** — forward returns and `adv63` need neighbouring days, so the window
+   `[target-63d .. target+21d]` of daily panels is loaded, features computed per ticker
+   along the trading-day axis, then each in-range day is written as the final CSV.
+
+To populate a target day's windowed features the task **auto-builds** bars for its lookback
++ forward window; days near the dataset edges get NaN `adv63` / forward returns.
+
+**Output:**
+
+```
+<out>/daily/<yyyy>/<YYYYMMDD>.parquet     # intermediate per-day bar panel (cached)
+<out>/processed/<YYYYMMDD>.csv            # final per-day file, all tickers, columns:
+    ticker,date,open,high,low,close,vwap,volume,amount,preclose,trading_minutes,
+    fwd_ret_1d,fwd_ret_5d,fwd_ret_21d,adv63
+```
+
+`ticker` is the 5-digit zero-padded HKG code (e.g. `00001`). By default `<out>` is
+`/data/<asset>_data/<market>/md_eod`.
+
+**Arguments:**
+
+| Arg               | Meaning                                                              |
+| ----------------- | ------------------------------------------------------------------- |
+| `--market`        | Market code (default `hkg`). Used in the derived paths.             |
+| `--asset`         | Asset class (default `eq`; `eq`→`equity_data`, `crypto`→`crypto_data`). |
+| `--date-range`    | `YYYYMMDD` or `YYYYMMDD:YYYYMMDD` (either side open) selecting which days get a `processed/` CSV; omit = all available days. |
+| `--snapshot-root` | Per-ticker snapshot tree (default derived `.../md_snapshot/raw`).    |
+| `--trade-root`    | Per-ticker trade tree (default derived `.../md_trade/raw`).          |
+| `--out`           | Output root (default derived `.../md_eod`; writes `daily/` + `processed/`). |
+| `--workers`       | Parallel processes for stage 1 (default `min(20, cpus)`).           |
+| `--force`         | Rebuild `daily/` bars even if they already exist.                   |
+| `--cross-check`   | Also read trade ticks and count volume mismatches (diagnostic; slower). |
+
+Key functions: `build_day(...) -> dict` (stage-1 per-day worker), `add_features(panel)`
+(stage-2 forward returns + adv63), and `main(argv)` (CLI + two-stage orchestration).
 
 **Dependencies:** `pandas`, `pyarrow` (plus the standard library).
 
